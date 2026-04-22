@@ -1,0 +1,20 @@
+experiment:
+  n_clients: 4
+  n_rounds: 1
+  local_epochs: 1
+  samples_per_client: 500
+
+gossip:
+  fanout: 2
+  max_hops: 3
+
+security:
+  use_hash: true
+
+logging:
+  log_file: experiment.log
+  log_level: INFO
+
+data:
+  batch_size: 32
+  alpha: 0.5
