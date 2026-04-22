@@ -9,20 +9,23 @@ from flwr_datasets import FederatedDataset
 from flwr_datasets.partitioner import DirichletPartitioner
 
 
-def _partition_to_tensordataset(partition) -> TensorDataset:
+def _partition_to_tensordataset(
+    partition,
+    normalize_mean: list[float],
+    normalize_std: list[float],
+) -> TensorDataset:
     """
     Convert one Flower/Hugging Face partition into a PyTorch TensorDataset.
     """
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,)),
+        transforms.Normalize(tuple(normalize_mean), tuple(normalize_std)),
     ])
 
     images = []
     labels = []
 
     for item in partition:
-        # item["image"] is a PIL image for MNIST in Flower Datasets
         img = transform(item["image"])
         label = int(item["label"])
 
@@ -37,46 +40,66 @@ def _partition_to_tensordataset(partition) -> TensorDataset:
 
 def make_client_loaders(
     n_clients: int,
-    batch_size: int = 32,
-    alpha: float = 0.5,
+    batch_size: int,
+    alpha: float,
+    dataset_name: str,
+    partition_by: str,
+    min_partition_size: int,
+    self_balancing: bool,
+    seed: int,
+    test_batch_size: int,
+    normalize_mean: list[float],
+    normalize_std: list[float],
 ) -> Tuple[List[DataLoader], DataLoader]:
     """
     Create non-IID client DataLoaders using Flower DirichletPartitioner.
 
     Args:
         n_clients: number of federated clients
-        batch_size: DataLoader batch size
+        batch_size: training DataLoader batch size
         alpha: Dirichlet concentration parameter
-               smaller alpha -> more non-IID
-               larger alpha -> more IID-like
+        dataset_name: dataset identifier
+        partition_by: column used for partitioning
+        min_partition_size: minimum samples per partition
+        self_balancing: whether to self-balance partitions
+        seed: random seed for partitioner
+        test_batch_size: test DataLoader batch size
+        normalize_mean: normalization mean
+        normalize_std: normalization std
 
     Returns:
         client_loaders: list of client train DataLoaders
-        test_loader: DataLoader for full MNIST test set
+        test_loader: DataLoader for full test split
     """
     partitioner = DirichletPartitioner(
         num_partitions=n_clients,
-        partition_by="label",
+        partition_by=partition_by,
         alpha=alpha,
-        min_partition_size=10,
-        self_balancing=True,
-        seed=42,
+        min_partition_size=min_partition_size,
+        self_balancing=self_balancing,
+        seed=seed,
     )
 
     fds = FederatedDataset(
-        dataset="ylecun/mnist",
+        dataset=dataset_name,
         partitioners={"train": partitioner},
     )
 
     client_loaders: List[DataLoader] = []
 
     logging.info(
-        f"Creating {n_clients} Dirichlet-based client partitions | alpha={alpha}"
+        f"Creating {n_clients} Dirichlet-based client partitions | "
+        f"dataset={dataset_name} alpha={alpha} partition_by={partition_by} "
+        f"min_partition_size={min_partition_size} self_balancing={self_balancing} seed={seed}"
     )
 
     for client_id in range(n_clients):
         partition = fds.load_partition(client_id, "train")
-        dataset = _partition_to_tensordataset(partition)
+        dataset = _partition_to_tensordataset(
+            partition,
+            normalize_mean=normalize_mean,
+            normalize_std=normalize_std,
+        )
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         client_loaders.append(loader)
 
@@ -87,8 +110,12 @@ def make_client_loaders(
         )
 
     test_partition = fds.load_split("test")
-    test_dataset = _partition_to_tensordataset(test_partition)
-    test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
+    test_dataset = _partition_to_tensordataset(
+        test_partition,
+        normalize_mean=normalize_mean,
+        normalize_std=normalize_std,
+    )
+    test_loader = DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False)
 
     logging.info(
         f"Created {n_clients} non-IID client loaders using DirichletPartitioner"

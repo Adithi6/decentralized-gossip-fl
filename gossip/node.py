@@ -1,8 +1,9 @@
 import logging
 from torch.utils.data import DataLoader
-from client.fl_client import FederatedClient
 
 import numpy as np
+
+from client.fl_client import FederatedClient
 from utils.weights import bytes_to_weight_arrays, apply_weight_arrays
 
 
@@ -11,18 +12,58 @@ class GossipNode:
     A GossipNode = FederatedClient + gossip inbox.
     """
 
-    def __init__(self, client_id: str, dataloader: DataLoader, device: str, use_hash: bool = False):
-        self.client = FederatedClient(client_id, dataloader, device, use_hash=use_hash)
+    def __init__(
+        self,
+        client_id: str,
+        dataloader: DataLoader,
+        device: str,
+        use_hash: bool,
+        hash_algorithm: str,
+        weight_dtype: str,
+        learning_rate: float,
+        crypto_scheme: str,
+        model_name: str,
+        input_channels: int,
+        num_classes: int,
+        input_height: int,
+        input_width: int,
+        conv1_channels: int,
+        conv2_channels: int,
+        hidden_dim: int,
+    ):
+        self.client = FederatedClient(
+            client_id=client_id,
+            dataloader=dataloader,
+            device=device,
+            use_hash=use_hash,
+            hash_algorithm=hash_algorithm,
+            weight_dtype=weight_dtype,
+            learning_rate=learning_rate,
+            crypto_scheme=crypto_scheme,
+            model_name=model_name,
+            input_channels=input_channels,
+            num_classes=num_classes,
+            input_height=input_height,
+            input_width=input_width,
+            conv1_channels=conv1_channels,
+            conv2_channels=conv2_channels,
+            hidden_dim=hidden_dim,
+        )
+
         self.own_submission: dict | None = None
         self.inbox: list[dict] = []
 
         self.client_id = client_id
         self.pk = self.client.pk
-        self.use_hash = use_hash
 
-        logging.info(f"[{self.client_id}] gossip node initialized | use_hash={self.use_hash}")
+        logging.info(
+            f"[{self.client_id}] gossip node initialized | "
+            f"use_hash={use_hash} hash_algorithm={hash_algorithm} "
+            f"weight_dtype={weight_dtype} learning_rate={learning_rate} "
+            f"scheme={crypto_scheme} model={model_name}"
+        )
 
-    def local_train(self, global_weight_arrays: list, epochs: int = 1):
+    def local_train(self, global_weight_arrays: list | None, epochs: int = 1):
         self.client.local_train(global_weight_arrays, epochs)
 
     def sign_update(self) -> dict:
@@ -61,9 +102,16 @@ class GossipNode:
 
         logging.info(f"[{self.client_id}] aggregating {len(submissions)} submission(s)")
 
+        # infer dtype from the client's configured weight dtype
+        dtype_name = self.client.weight_dtype
+
         weight_sets = []
         for sub in submissions:
-            arrays = bytes_to_weight_arrays(sub["update_bytes"], template_model)
+            arrays = bytes_to_weight_arrays(
+                sub["update_bytes"],
+                template_model,
+                dtype_name=dtype_name,
+            )
             weight_sets.append(arrays)
 
         averaged = [

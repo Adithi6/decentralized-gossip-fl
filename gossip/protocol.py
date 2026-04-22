@@ -1,6 +1,7 @@
 import logging
 import random
 import hashlib
+
 from gossip.node import GossipNode
 from crypto import dilithium_utils
 
@@ -8,13 +9,15 @@ from crypto import dilithium_utils
 class GossipProtocol:
     def __init__(
         self,
-        fanout: int = 2,
-        max_hops: int = 3,
-        all_pub_keys: dict[str, bytes] = None,
+        fanout: int,
+        max_hops: int,
+        all_pub_keys: dict[str, bytes],
+        crypto_scheme: str,
     ):
         self.fanout = fanout
         self.max_hops = max_hops
-        self.all_pub_keys = all_pub_keys or {}
+        self.all_pub_keys = all_pub_keys
+        self.crypto_scheme = crypto_scheme
 
         # Track: ((original_sender_id, payload), forwarder_id)
         self._seen: set[tuple[tuple[str, bytes], str]] = set()
@@ -25,16 +28,36 @@ class GossipProtocol:
         self.gossip_timings.clear()
         logging.info("Gossip round state reset")
 
+    def _compute_expected_payload(self, message: dict) -> bytes:
+        """
+        Recompute expected payload from update_bytes based on message metadata.
+        Requires:
+            - message["is_hashed"]: bool
+            - message["hash_algorithm"]: str if is_hashed is True
+        """
+        if "is_hashed" not in message:
+            raise KeyError("Message missing required field: 'is_hashed'")
+
+        if not message["is_hashed"]:
+            return message["update_bytes"]
+
+        if "hash_algorithm" not in message:
+            raise KeyError("Message missing required field: 'hash_algorithm'")
+
+        hash_algorithm = message["hash_algorithm"].lower()
+
+        if hash_algorithm == "sha256":
+            return hashlib.sha256(message["update_bytes"]).digest()
+
+        raise ValueError(f"Unsupported hash algorithm: {hash_algorithm}")
+
     def _verify_before_forward(self, message: dict) -> tuple[bool, float]:
         pk = self.all_pub_keys.get(message["client_id"])
         if pk is None:
             logging.error(f"Missing public key for {message['client_id']}")
             return False, 0.0
 
-        if len(message["payload"]) == 32:
-            expected_payload = hashlib.sha256(message["update_bytes"]).digest()
-        else:
-            expected_payload = message["update_bytes"]
+        expected_payload = self._compute_expected_payload(message)
 
         if expected_payload != message["payload"]:
             logging.warning(
@@ -43,7 +66,10 @@ class GossipProtocol:
             return False, 0.0
 
         is_valid, verify_ms = dilithium_utils.verify(
-            pk, message["payload"], message["signature"]
+            pk,
+            message["payload"],
+            message["signature"],
+            self.crypto_scheme,
         )
 
         if not is_valid:

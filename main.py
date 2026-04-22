@@ -12,17 +12,18 @@ from gossip.protocol import GossipProtocol
 from utils.weights import model_to_weight_arrays
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler("experiment.log"),
-        logging.StreamHandler()
-    ]
-)
-
-
 REGISTRY_FILE = "client_registry.json"
+
+
+def setup_logging(config):
+    logging.basicConfig(
+        level=getattr(logging, config["logging"]["log_level"]),
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        handlers=[
+            logging.FileHandler(config["logging"]["log_file"]),
+            logging.StreamHandler()
+        ]
+    )
 
 
 def load_config(path="config.yaml"):
@@ -30,58 +31,46 @@ def load_config(path="config.yaml"):
         return yaml.safe_load(f)
 
 
-def save_public_keys_to_json(nodes, path=REGISTRY_FILE):
-    registry = {}
-    for node in nodes:
-        registry[node.client_id] = base64.b64encode(node.pk).decode("utf-8")
-
+def save_public_keys_to_json(nodes, path):
+    registry = {
+        node.client_id: base64.b64encode(node.pk).decode("utf-8")
+        for node in nodes
+    }
     with open(path, "w") as f:
         json.dump(registry, f, indent=2)
-
     logging.info(f"Public key registry saved to {path}")
 
 
-def load_public_keys_from_json(path=REGISTRY_FILE) -> dict[str, bytes]:
+def load_public_keys_from_json(path):
     with open(path, "r") as f:
         registry = json.load(f)
-
-    all_pub_keys = {
-        client_id: base64.b64decode(pk_b64.encode("utf-8"))
-        for client_id, pk_b64 in registry.items()
+    return {
+        cid: base64.b64decode(pk.encode("utf-8"))
+        for cid, pk in registry.items()
     }
 
-    logging.info(f"Public key registry loaded from {path}")
-    return all_pub_keys
 
+def choose_aggregator_node(nodes):
+    counts = [(node, len(node.get_all_submissions())) for node in nodes]
 
-def choose_aggregator_node(nodes: list[GossipNode]) -> GossipNode:
-    """
-    Choose the aggregator node based on who has the most submissions.
-    Tie-break: random choice among top nodes.
-    """
-    counts = []
-    for node in nodes:
-        submission_count = len(node.get_all_submissions())
-        counts.append((node, submission_count))
-        logging.info(
-            f"[aggregator-selection] {node.client_id} has {submission_count} submission(s)"
-        )
+    for node, count in counts:
+        logging.info(f"{node.client_id} submissions = {count}")
 
-    max_count = max(count for _, count in counts)
-    candidates = [node for node, count in counts if count == max_count]
+    max_count = max(c for _, c in counts)
+    candidates = [n for n, c in counts if c == max_count]
+
     aggregator = random.choice(candidates)
-
-    logging.info(
-        f"Selected aggregator: {aggregator.client_id} "
-        f"(received {max_count} submission(s))"
-    )
+    logging.info(f"Selected aggregator: {aggregator.client_id}")
     return aggregator
 
 
 def main():
     config = load_config()
-    logging.info("Configuration loaded successfully from config.yaml")
+    setup_logging(config)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # -------- CONFIG --------
     N_CLIENTS = config["experiment"]["n_clients"]
     N_ROUNDS = config["experiment"]["n_rounds"]
     LOCAL_EPOCHS = config["experiment"]["local_epochs"]
@@ -90,107 +79,99 @@ def main():
     GOSSIP_MAX_HOPS = config["gossip"]["max_hops"]
 
     USE_HASH = config["security"]["use_hash"]
+    HASH_ALGO = config["security"]["hash_algorithm"]
 
-    BATCH_SIZE = config["data"]["batch_size"]
-    ALPHA = config["data"]["alpha"]
+    CRYPTO_SCHEME = config["crypto"]["scheme"]
 
-    start_time = time.time()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    LEARNING_RATE = config["training"]["learning_rate"]
 
-    logging.info(f"Device: {device}")
-    logging.info(
-        f"Config: {N_CLIENTS} clients | {N_ROUNDS} rounds | "
-        f"{LOCAL_EPOCHS} local epoch(s) | "
-        f"batch_size={BATCH_SIZE} | alpha={ALPHA} | "
-        f"gossip fanout={GOSSIP_FANOUT} max_hops={GOSSIP_MAX_HOPS} | "
-        f"use_hash={USE_HASH}"
-    )
+    MODEL = config["model"]
+    DATA = config["data"]
+    WEIGHTS = config["weights"]
 
+    # -------- DATA --------
     client_loaders, _ = make_client_loaders(
         n_clients=N_CLIENTS,
-        batch_size=BATCH_SIZE,
-        alpha=ALPHA,
+        batch_size=DATA["batch_size"],
+        alpha=DATA["alpha"],
+        dataset_name=DATA["dataset_name"],
+        partition_by=DATA["partition_by"],
+        min_partition_size=DATA["min_partition_size"],
+        self_balancing=DATA["self_balancing"],
+        seed=DATA["seed"],
+        test_batch_size=DATA["test_batch_size"],
+        normalize_mean=DATA["normalize_mean"],
+        normalize_std=DATA["normalize_std"],
     )
 
-    logging.info("Node creation and key generation started")
-    nodes: list[GossipNode] = []
+    # -------- NODES --------
+    nodes = []
     for i in range(N_CLIENTS):
         node = GossipNode(
-            f"client_{i}",
-            client_loaders[i],
-            device,
-            use_hash=USE_HASH
+            client_id=f"client_{i}",
+            dataloader=client_loaders[i],
+            device=device,
+            use_hash=USE_HASH,
+            learning_rate=LEARNING_RATE,
+            crypto_scheme=CRYPTO_SCHEME,
+            model_name=MODEL["name"],
+            hash_algorithm=HASH_ALGO,
+            weight_dtype=WEIGHTS["dtype"],
+            input_channels=MODEL["input_channels"],
+            num_classes=MODEL["num_classes"],
+            input_height=MODEL["input_height"],
+            input_width=MODEL["input_width"],
+            conv1_channels=MODEL["conv1_channels"],
+            conv2_channels=MODEL["conv2_channels"],
+            hidden_dim=MODEL["hidden_dim"],
         )
         nodes.append(node)
 
-    # Save and reload public keys using JSON registry
     save_public_keys_to_json(nodes, REGISTRY_FILE)
     all_pub_keys = load_public_keys_from_json(REGISTRY_FILE)
 
+    # -------- GOSSIP --------
     gossip = GossipProtocol(
         fanout=GOSSIP_FANOUT,
         max_hops=GOSSIP_MAX_HOPS,
         all_pub_keys=all_pub_keys,
+        crypto_scheme=CRYPTO_SCHEME,
     )
 
-    # Random node initializes the starting global model
-    initializer_node = random.choice(nodes)
-    initial_weights = model_to_weight_arrays(initializer_node.client.model)
-
-    logging.info(f"Random initializer selected: {initializer_node.client_id}")
+    # -------- INIT MODEL --------
+    initializer = random.choice(nodes)
+    init_weights = model_to_weight_arrays(initializer.client.model)
 
     for node in nodes:
-        node.local_train(initial_weights, epochs=0)
+        node.local_train(init_weights, epochs=0)
 
-    for round_num in range(1, N_ROUNDS + 1):
-        round_start = time.time()
-        logging.info(f"Round {round_num}/{N_ROUNDS} started")
+    # -------- TRAINING --------
+    start_time = time.time()
 
-        logging.info("Training phase started")
+    for r in range(1, N_ROUNDS + 1):
+        logging.info(f"Round {r}")
+
         for node in nodes:
             node.local_train(None, epochs=LOCAL_EPOCHS)
 
-        logging.info("Signing phase started")
         for node in nodes:
             node.sign_update()
 
-        logging.info("Gossip propagation started")
         gossip.run_round(nodes)
-        gossip.print_gossip_summary()
 
-        logging.info("Aggregator selection started")
-        aggregator_node = choose_aggregator_node(nodes)
+        aggregator = choose_aggregator_node(nodes)
+        subs = aggregator.get_all_submissions()
 
-        logging.info("Leader-based aggregation started")
-        aggregator_submissions = aggregator_node.get_all_submissions()
+        if subs:
+            aggregator.aggregate_local_updates(subs, aggregator.client.model)
 
-        if aggregator_submissions:
-            aggregator_node.aggregate_local_updates(
-                aggregator_submissions,
-                aggregator_node.client.model
-            )
+            weights = model_to_weight_arrays(aggregator.client.model)
 
-            # Share aggregator's updated model to all nodes
-            aggregated_weights = model_to_weight_arrays(aggregator_node.client.model)
             for node in nodes:
-                node.local_train(aggregated_weights, epochs=0)
-
-            logging.info(
-                f"Aggregated model from {aggregator_node.client_id} "
-                f"shared with all nodes"
-            )
-        else:
-            logging.warning(
-                f"No submissions available at aggregator {aggregator_node.client_id}"
-            )
-
-        round_end = time.time()
-        logging.info(
-            f"Round {round_num} execution time: {round_end - round_start:.2f} seconds"
-        )
+                node.local_train(weights, epochs=0)
 
     end_time = time.time()
-    logging.info(f"Total execution time: {end_time - start_time:.2f} seconds")
+    logging.info(f"Total time = {end_time - start_time:.2f}s")
 
 
 if __name__ == "__main__":
