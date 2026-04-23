@@ -2,7 +2,6 @@ import logging
 import random
 import hashlib
 
-from gossip.node import GossipNode
 from crypto import dilithium_utils
 
 
@@ -19,22 +18,16 @@ class GossipProtocol:
         self.all_pub_keys = all_pub_keys
         self.crypto_scheme = crypto_scheme
 
-        # Track: ((original_sender_id, payload), forwarder_id)
-        self._seen: set[tuple[tuple[str, bytes], str]] = set()
+        # track forwarded state: (origin_client_id, forwarder_client_id)
+        self._seen_forward: set[tuple[str, str]] = set()
         self.gossip_timings: list[dict] = []
 
     def reset_round(self):
-        self._seen.clear()
+        self._seen_forward.clear()
         self.gossip_timings.clear()
         logging.info("Gossip round state reset")
 
     def _compute_expected_payload(self, message: dict) -> bytes:
-        """
-        Recompute expected payload from update_bytes based on message metadata.
-        Requires:
-            - message["is_hashed"]: bool
-            - message["hash_algorithm"]: str if is_hashed is True
-        """
         if "is_hashed" not in message:
             raise KeyError("Message missing required field: 'is_hashed'")
 
@@ -44,12 +37,12 @@ class GossipProtocol:
         if "hash_algorithm" not in message:
             raise KeyError("Message missing required field: 'hash_algorithm'")
 
-        hash_algorithm = message["hash_algorithm"].lower()
+        algo = message["hash_algorithm"].lower()
 
-        if hash_algorithm == "sha256":
+        if algo == "sha256":
             return hashlib.sha256(message["update_bytes"]).digest()
 
-        raise ValueError(f"Unsupported hash algorithm: {hash_algorithm}")
+        raise ValueError(f"Unsupported hash algorithm: {algo}")
 
     def _verify_before_forward(self, message: dict) -> tuple[bool, float]:
         pk = self.all_pub_keys.get(message["client_id"])
@@ -73,39 +66,37 @@ class GossipProtocol:
         )
 
         if not is_valid:
-            logging.warning(
-                f"Signature verification failed for {message['client_id']}"
-            )
+            logging.warning(f"Signature verification failed for {message['client_id']}")
 
         return is_valid, verify_ms
 
     def spread(
         self,
-        origin_node: "GossipNode",
-        all_nodes: list["GossipNode"],
+        origin_node,
+        all_nodes,
         message: dict,
         hop: int = 0,
     ):
-        # Unique identity of the message = original sender + payload
-        message_id = (message["client_id"], message["payload"])
-        state_id = (message_id, origin_node.client_id)
+        origin_client_id = message["client_id"]
+        state_id = (origin_client_id, origin_node.client_id)
 
-        if state_id in self._seen:
+        if state_id in self._seen_forward:
             logging.info(
-                f"Gossip message from {message['client_id']} already forwarded by "
+                f"Gossip message from {origin_client_id} already forwarded by "
                 f"{origin_node.client_id}, skipping"
             )
             return
 
         if hop >= self.max_hops:
-            logging.info(
-                f"Max hops reached for message from {message['client_id']}"
-            )
+            logging.info(f"Max hops reached for message from {origin_client_id}")
             return
 
-        self._seen.add(state_id)
+        self._seen_forward.add(state_id)
 
         peers = [n for n in all_nodes if n.client_id != origin_node.client_id]
+        if not peers:
+            return
+
         targets = random.sample(peers, min(self.fanout, len(peers)))
 
         for target in targets:
@@ -114,6 +105,7 @@ class GossipProtocol:
             self.gossip_timings.append({
                 "from": origin_node.client_id,
                 "to": target.client_id,
+                "origin": origin_client_id,
                 "hop": hop + 1,
                 "verify_ms": round(verify_ms, 3),
                 "accepted": is_valid,
@@ -125,11 +117,13 @@ class GossipProtocol:
                 f"[{'OK' if is_valid else 'REJECTED'}]"
             )
 
-            if is_valid:
-                target.receive_gossip(message)
-                self.spread(target, all_nodes, message, hop=hop + 1)
+            if not is_valid:
+                continue
 
-    def run_round(self, nodes: list["GossipNode"]):
+            target.receive_gossip(message)
+            self.spread(target, all_nodes, message, hop=hop + 1)
+
+    def run_round(self, nodes):
         self.reset_round()
 
         for node in nodes:
@@ -143,6 +137,7 @@ class GossipProtocol:
                 origin_node=node,
                 all_nodes=nodes,
                 message=node.own_submission,
+                hop=0,
             )
 
     def print_gossip_summary(self):
@@ -150,15 +145,17 @@ class GossipProtocol:
             logging.info("No gossip timings recorded for this round")
             return
 
-        logging.info("-" * 54)
+        logging.info("-" * 70)
         logging.info(f"Gossip log (fanout={self.fanout} max_hops={self.max_hops})")
-        logging.info("-" * 54)
-        logging.info(f"{'From':<12} {'To':<12} {'Hop':<5} {'Verify (ms)':<14} Accepted")
-        logging.info("-" * 54)
+        logging.info("-" * 70)
+        logging.info(
+            f"{'Origin':<12} {'From':<12} {'To':<12} {'Hop':<5} {'Verify (ms)':<14} Accepted"
+        )
+        logging.info("-" * 70)
 
         for t in self.gossip_timings:
             logging.info(
-                f"{t['from']:<12} {t['to']:<12} {t['hop']:<5} "
+                f"{t['origin']:<12} {t['from']:<12} {t['to']:<12} {t['hop']:<5} "
                 f"{t['verify_ms']:<14} {t['accepted']}"
             )
 

@@ -1,6 +1,5 @@
 import logging
 from torch.utils.data import DataLoader
-
 import numpy as np
 
 from client.fl_client import FederatedClient
@@ -10,6 +9,7 @@ from utils.weights import bytes_to_weight_arrays, apply_weight_arrays
 class GossipNode:
     """
     A GossipNode = FederatedClient + gossip inbox.
+    Stores one unique submission per originating client.
     """
 
     def __init__(
@@ -50,11 +50,11 @@ class GossipNode:
             hidden_dim=hidden_dim,
         )
 
-        self.own_submission: dict | None = None
-        self.inbox: list[dict] = []
-
         self.client_id = client_id
         self.pk = self.client.pk
+
+        self.own_submission: dict | None = None
+        self.inbox: dict[str, dict] = {}
 
         logging.info(
             f"[{self.client_id}] gossip node initialized | "
@@ -68,32 +68,46 @@ class GossipNode:
 
     def sign_update(self) -> dict:
         self.own_submission = self.client.sign_update()
-        self.inbox = []
+        self.inbox.clear()
         logging.info(f"[{self.client_id}] own submission stored and inbox reset")
         return self.own_submission
 
     def receive_gossip(self, message: dict):
-        already_have = any(
-            m["payload"] == message["payload"] for m in self.inbox
-        )
+        origin_id = message["client_id"]
 
-        if not already_have:
-            self.inbox.append(message)
-            logging.info(
-                f"[{self.client_id}] received gossip from {message['client_id']} "
-                f"| inbox_size={len(self.inbox)}"
-            )
-        else:
+        # ignore own message returning back
+        if origin_id == self.client_id:
             logging.warning(
-                f"[{self.client_id}] duplicate gossip ignored from {message['client_id']}"
+                f"[{self.client_id}] ignored returned own gossip from {origin_id}"
             )
+            return
+
+        # keep only one message per originating client
+        if origin_id in self.inbox:
+            logging.warning(
+                f"[{self.client_id}] duplicate gossip ignored from {origin_id}"
+            )
+            return
+
+        self.inbox[origin_id] = message
+        logging.info(
+            f"[{self.client_id}] received gossip from {origin_id} "
+            f"| inbox_size={len(self.inbox)}"
+        )
 
     def get_all_submissions(self) -> list[dict]:
         all_subs = []
-        if self.own_submission:
+
+        if self.own_submission is not None:
             all_subs.append(self.own_submission)
-        all_subs.extend(self.inbox)
+
+        all_subs.extend(self.inbox.values())
         return all_subs
+
+    def clear_submissions(self):
+        self.own_submission = None
+        self.inbox.clear()
+        logging.info(f"[{self.client_id}] cleared round submissions")
 
     def aggregate_local_updates(self, submissions: list[dict], template_model):
         if not submissions:
@@ -102,7 +116,6 @@ class GossipNode:
 
         logging.info(f"[{self.client_id}] aggregating {len(submissions)} submission(s)")
 
-        # infer dtype from the client's configured weight dtype
         dtype_name = self.client.weight_dtype
 
         weight_sets = []

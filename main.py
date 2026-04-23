@@ -17,7 +17,7 @@ REGISTRY_FILE = "client_registry.json"
 
 def setup_logging(config):
     logging.basicConfig(
-        level=getattr(logging, config["logging"]["log_level"]),
+        level=getattr(logging, config["logging"]["log_level"].upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
             logging.FileHandler(config["logging"]["log_file"]),
@@ -51,9 +51,12 @@ def load_public_keys_from_json(path):
 
 
 def choose_aggregator_node(nodes):
-    counts = [(node, len(node.get_all_submissions())) for node in nodes]
+    counts = []
 
-    for node, count in counts:
+    for node in nodes:
+        subs = node.get_all_submissions()
+        count = len(subs)
+        counts.append((node, count))
         logging.info(f"{node.client_id} submissions = {count}")
 
     max_count = max(c for _, c in counts)
@@ -64,11 +67,23 @@ def choose_aggregator_node(nodes):
     return aggregator
 
 
+def sync_weights_to_all_nodes(nodes, weights):
+    for node in nodes:
+        node.local_train(weights, epochs=0)
+
+
+def clear_round_state(nodes, gossip):
+    for node in nodes:
+        node.clear_submissions()
+    gossip.reset_round()
+
+
 def main():
     config = load_config()
     setup_logging(config)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    logging.info(f"Using device: {device}")
 
     # -------- CONFIG --------
     N_CLIENTS = config["experiment"]["n_clients"]
@@ -127,6 +142,7 @@ def main():
         )
         nodes.append(node)
 
+    # -------- REGISTRY --------
     save_public_keys_to_json(nodes, REGISTRY_FILE)
     all_pub_keys = load_public_keys_from_json(REGISTRY_FILE)
 
@@ -138,37 +154,62 @@ def main():
         crypto_scheme=CRYPTO_SCHEME,
     )
 
-    # -------- INIT MODEL --------
+    # -------- INITIAL MODEL SYNC --------
     initializer = random.choice(nodes)
     init_weights = model_to_weight_arrays(initializer.client.model)
-
-    for node in nodes:
-        node.local_train(init_weights, epochs=0)
+    sync_weights_to_all_nodes(nodes, init_weights)
+    logging.info(f"Initial model taken from {initializer.client_id} and synced to all nodes")
 
     # -------- TRAINING --------
     start_time = time.time()
 
     for r in range(1, N_ROUNDS + 1):
-        logging.info(f"Round {r}")
+        logging.info("=" * 60)
+        logging.info(f"Round {r}/{N_ROUNDS}")
+        logging.info("=" * 60)
 
+        # clear stale state before round
+        clear_round_state(nodes, gossip)
+
+        # 1. local training
         for node in nodes:
             node.local_train(None, epochs=LOCAL_EPOCHS)
 
+        # 2. sign updates
         for node in nodes:
             node.sign_update()
 
+        # 3. gossip propagation
         gossip.run_round(nodes)
 
+        # 4. choose aggregator
         aggregator = choose_aggregator_node(nodes)
         subs = aggregator.get_all_submissions()
 
-        if subs:
+        # 5. aggregate
+        if len(subs) == N_CLIENTS:
+            logging.info(
+                f"[{aggregator.client_id}] aggregating complete round "
+                f"({len(subs)}/{N_CLIENTS} submissions)"
+            )
+        else:
+            logging.warning(
+                f"[{aggregator.client_id}] incomplete aggregation: "
+                f"{len(subs)}/{N_CLIENTS} submissions available"
+            )
+
+        if len(subs) > 0:
             aggregator.aggregate_local_updates(subs, aggregator.client.model)
 
+            # 6. sync aggregated weights to all nodes
             weights = model_to_weight_arrays(aggregator.client.model)
+            sync_weights_to_all_nodes(nodes, weights)
+            logging.info(f"Round {r} aggregated model synced to all nodes")
+        else:
+            logging.warning(f"Round {r} skipped because no submissions were available")
 
-            for node in nodes:
-                node.local_train(weights, epochs=0)
+        # clear state after round also
+        clear_round_state(nodes, gossip)
 
     end_time = time.time()
     logging.info(f"Total time = {end_time - start_time:.2f}s")
